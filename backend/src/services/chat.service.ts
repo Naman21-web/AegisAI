@@ -1,12 +1,8 @@
-import llmService from "./llm.service.js";
+import agentService from "./agent.service.js";
 
 class ChatService {
   async chat(message: string) {
-    const response = await llmService.generateResponse(message);
-
-    return {
-      message: response,
-    };
+    return agentService.run(message);
   }
 }
 
