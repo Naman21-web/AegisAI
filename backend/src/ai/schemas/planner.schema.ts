@@ -1,64 +1,26 @@
 import { z } from "zod";
 
 export const plannerSchema = z.object({
-  intent: z
-    .string()
-    .describe("The user's primary intent"),
+  intent: z.string(),
 
-  goal: z
-    .string()
-    .describe(
-      "What the agent needs to accomplish for the user"
-    ),
+  goal: z.string(),
 
-  requiresTools: z
-    .boolean()
-    .describe(
-      "Whether external tools are required"
-    ),
+  requiresTools: z.boolean(),
+
+  needsClarification: z.boolean(),
+
+  clarificationQuestion: z.string(),
 
   steps: z.array(
     z.object({
-      tool: z
-        .enum([
-          "get_service_status",
-          "get_recent_errors",
-        ])
-        .describe(
-          "The tool that should be executed"
-        ),
+      tool: z.string(),
 
-      reason: z
-        .string()
-        .describe(
-          "Why this tool is needed"
-        ),
+      reason: z.string(),
 
-      arguments: z
-        .object({
-          service: z
-            .string()
-            .optional()
-            .describe(
-              "The service name, for example payment-service"
-            ),
-
-          limit: z
-            .number()
-            .int()
-            .min(1)
-            .max(10)
-            .optional()
-            .describe(
-              "Maximum number of errors to retrieve"
-            ),
-        })
-        .describe(
-          "Arguments required by the selected tool"
-        ),
+      arguments: z.object({
+        service: z.string().optional(),
+        limit: z.number().optional(),
+      }),
     })
   ),
 });
-
-export type PlannerOutput =
-  z.infer<typeof plannerSchema>;

@@ -2,43 +2,31 @@ import {
   StateGraph,
   START,
   END,
+  MemorySaver,
 } from "@langchain/langgraph";
 
-import {
-  ChatGoogleGenerativeAI,
-} from "@langchain/google-genai";
-import { MemorySaver } from "@langchain/langgraph";
-
-import {
-  AIMessage,
-  BaseMessage,
-  HumanMessage,
-  SystemMessage,
-} from "@langchain/core/messages";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 
 import { AgentState } from "../state/agent.state.js";
 
-import {
-  getServiceStatusTool,
-} from "../tools/service-status.tool.js";
-
-import {
-  getRecentErrorsTool,
-} from "../tools/recent-errors.tool.js";
+import { getServiceStatusTool } from "../tools/service-status.tool.js";
+import { getRecentErrorsTool } from "../tools/recent-errors.tool.js";
 
 import { plannerSchema } from "../schemas/planner.schema.js";
 
 import { env } from "../../config/env.js";
+
 
 // ============================================================
 // 1. GEMINI MODEL
 // ============================================================
 
 const model = new ChatGoogleGenerativeAI({
-  model: "gemini-3.6-flash",
+  model: "gemini-3.1-flash-lite",
   temperature: 0.2,
   apiKey: env.GOOGLE_API_KEY,
 });
+
 
 // Planner uses structured output
 const plannerModel =
@@ -46,72 +34,86 @@ const plannerModel =
     plannerSchema
   );
 
+
 // ============================================================
 // 2. TOOL REGISTRY
 // ============================================================
 
 const toolRegistry = {
-  get_service_status:
-    getServiceStatusTool,
-
-  get_recent_errors:
-    getRecentErrorsTool,
+  get_service_status: getServiceStatusTool,
+  get_recent_errors: getRecentErrorsTool,
 };
 
-// ============================================================
-// 3. HELPER
-// ============================================================
-
-function normalizeMessageContent(
-  message: BaseMessage
-): string {
-  if (typeof message.content === "string") {
-    return message.content;
-  }
-
-  return JSON.stringify(
-    message.content
-  );
-}
 
 // ============================================================
-// 4. PLANNER
+// 3. PLANNER
 // ============================================================
 
 async function createPlan(
   state: typeof AgentState.State
 ) {
-  /*
-   * We intentionally use:
-   *
-   * SystemMessage
-   * followed by conversation messages.
-   *
-   * This prevents Gemini's:
-   *
-   * "System message should be the first one"
-   *
-   * error.
-   */
 
-  const conversationMessages =
-    state.messages ?? [];
+  console.log(
+    "\n========== PLANNER CONTEXT =========="
+  );
+
+  console.log(
+    "Current message:",
+    state.userMessage
+  );
+
+  console.log(
+    "Messages:",
+    state.messages
+  );
+
+  console.log(
+    "=====================================\n"
+  );
+
+
+  const conversationHistory =
+    state.messages.length > 0
+      ? state.messages
+          .map((message) => {
+
+            const type =
+              message._getType();
+
+            return `${type}: ${message.content}`;
+          })
+          .join("\n\n")
+      : "(No previous conversation in this thread.)";
+
 
   const plan =
     await plannerModel.invoke([
-      new SystemMessage(`
+
+      // ======================================================
+      // SYSTEM
+      // ======================================================
+
+      {
+        role: "system",
+
+        content: `
 You are the planning component of AegisAI.
 
-Your job is to analyze the user's request and create
-a structured execution plan.
+Your job is to analyze the user's CURRENT request
+and create a structured execution plan.
 
-DO NOT answer the user.
+You MUST use the actual conversation history when
+resolving references such as:
 
-You have access to the following tools.
+- "it"
+- "this service"
+- "that service"
+- "those errors"
+- "why is it failing?"
 
---------------------------------------------------
+==================================================
 AVAILABLE TOOLS
---------------------------------------------------
+==================================================
 
 1. get_service_status
 
@@ -122,14 +124,6 @@ Purpose:
 - availability
 - deployed version
 
-Arguments:
-
-{
-  "service": "service-name"
-}
-
---------------------------------------------------
-
 2. get_recent_errors
 
 Purpose:
@@ -139,203 +133,230 @@ Purpose:
 - troubleshooting
 - investigating degraded services
 
-Arguments:
+==================================================
+IMPORTANT ENTITY RESOLUTION RULES
+==================================================
 
-{
-  "service": "service-name",
-  "limit": 5
-}
+A service name may ONLY come from:
 
---------------------------------------------------
+1. The current user request
+
+OR
+
+2. The ACTUAL conversation history supplied
+to you.
+
+Never obtain a service name from:
+
+- examples in this system prompt
+- tool descriptions
+- hypothetical conversations
+- your own assumptions
+- common service names
+
+The examples in this prompt are instructional only.
+They are NOT conversation history.
+
+If the user says:
+
+"What errors are causing it?"
+
+and there is NO service name in the current request
+and NO service name in the actual conversation history:
+
+DO NOT guess the service.
+
+Set:
+
+requiresTools = false
+
+needsClarification = true
+
+steps = []
+
+and ask:
+
+"Which service would you like me to check?"
+
+==================================================
 PLANNING RULES
---------------------------------------------------
+==================================================
 
-1. If the question can be answered without
-   external information:
+1. Current service status:
 
-   requiresTools = false
+Use:
 
-   steps = []
+get_service_status
 
-2. If the user asks for current service status,
-   use:
+2. Recent errors:
 
-   get_service_status
+Use:
 
-3. If the user asks why a service is degraded,
-   failing, unhealthy, or asks to troubleshoot it:
+get_recent_errors
 
-   First:
+3. Troubleshooting a degraded service:
 
-   get_service_status
+Use:
 
-   Then:
+get_service_status
 
-   get_recent_errors
+Then:
 
-4. Do not invent tools.
+get_recent_errors
 
-5. Keep the plan minimal.
+4. If the user asks what errors are causing
+a previously discussed service:
 
-6. Arguments must contain actual values extracted
-   from the user's request or conversation history.
+Resolve the service from the actual
+conversation history.
 
-7. Use conversation history to resolve references such as:
+5. If the service cannot be resolved:
 
-   - "it"
-   - "that service"
-   - "the service"
-   - "its version"
-   - "its errors"
-   - "what about it?"
-   - "why is it failing?"
+Do NOT execute tools.
 
-8. If a previous conversation message establishes
-   the service name, reuse it when the current message
-   uses a pronoun or implicit reference.
+Set:
 
-9. Do not answer the user.
+requiresTools = false
 
-10. Return ONLY the structured execution plan.
+needsClarification = true
 
---------------------------------------------------
-EXAMPLES
---------------------------------------------------
+steps = []
 
-User:
+6. If the question does not require tools:
 
-"What is the current status of payment-service?"
+requiresTools = false
 
-Plan:
+needsClarification = false
 
-{
-  "intent": "check_service_status",
-  "goal": "Determine the current status of payment-service",
-  "requiresTools": true,
-  "steps": [
-    {
-      "tool": "get_service_status",
-      "reason": "Retrieve the current health and status of payment-service",
-      "arguments": {
-        "service": "payment-service"
-      }
-    }
-  ]
-}
+steps = []
 
-User:
+7. Do not invent tools.
 
-"Why is payment-service degraded?"
+8. Keep the plan minimal.
 
-Plan:
+9. Arguments must contain values extracted
+from the current request or actual conversation
+history.
 
-{
-  "intent": "troubleshoot_degraded_service",
-  "goal": "Investigate why payment-service is degraded",
-  "requiresTools": true,
-  "steps": [
-    {
-      "tool": "get_service_status",
-      "reason": "Check the current health and status of payment-service",
-      "arguments": {
-        "service": "payment-service"
-      }
-    },
-    {
-      "tool": "get_recent_errors",
-      "reason": "Retrieve recent errors from payment-service to identify the cause of degradation",
-      "arguments": {
-        "service": "payment-service",
-        "limit": 5
-      }
-    }
-  ]
-}
+==================================================
+IMPORTANT
+==================================================
 
-User:
+You are ONLY responsible for planning.
 
-"What is a Redis distributed lock?"
+Do NOT answer the user's question.
 
-Plan:
+Do NOT execute tools.
 
-{
-  "intent": "technical_question",
-  "goal": "Explain Redis distributed locks",
-  "requiresTools": false,
-  "steps": []
-}
-`),
+Do NOT invent missing entities.
+`,
+      },
 
-      /*
-       * Conversation history comes after SystemMessage.
-       *
-       * This allows the planner to understand
-       * references to previous turns.
-       */
 
-      ...conversationMessages,
+      // ======================================================
+      // USER
+      // ======================================================
 
-      /*
-       * Safety fallback:
-       *
-       * If messages somehow does not contain
-       * the current user message, include it.
-       */
+      {
+        role: "user",
 
-      ...(conversationMessages.length === 0
-        ? [
-            new HumanMessage(
-              state.userMessage
-            ),
-          ]
-        : []),
+        content: `
+ACTUAL CONVERSATION HISTORY
+============================
+
+${conversationHistory}
+
+============================
+
+CURRENT USER REQUEST
+============================
+
+${state.userMessage}
+
+============================
+
+Remember:
+
+The conversation history above is the ONLY source
+you may use to resolve references from previous
+messages.
+`,
+      },
     ]);
+
 
   console.log(
     "\n========== AGENT PLAN =========="
   );
 
-  console.dir(plan, {
-    depth: 10,
-  });
+  console.dir(
+    plan,
+    {
+      depth: 10,
+    }
+  );
 
   console.log(
     "================================\n"
   );
 
+
   return {
+
     plan,
-    intent: plan.intent,
+
+    intent:
+      plan.intent,
+
+    needsClarification:
+      plan.needsClarification,
+
+    clarificationQuestion:
+      plan.clarificationQuestion,
   };
 }
 
+
 // ============================================================
-// 5. DETERMINISTIC TOOL EXECUTOR
+// 4. DETERMINISTIC TOOL EXECUTOR
 // ============================================================
 
 async function executePlan(
   state: typeof AgentState.State
 ) {
+
   const plan = state.plan as {
+
     intent: string;
+
     goal: string;
+
     requiresTools: boolean;
 
+    needsClarification: boolean;
+
     steps: Array<{
+
       tool: string;
 
       reason: string;
 
       arguments: {
+
         service?: string;
+
         limit?: number;
+
       };
+
     }>;
+
   };
 
-  /*
-   * No tools required.
-   */
+
+  // ----------------------------------------------------------
+  // No tools required
+  // ----------------------------------------------------------
 
   if (
     !plan ||
@@ -343,21 +364,24 @@ async function executePlan(
     !plan.steps ||
     plan.steps.length === 0
   ) {
+
     return {
       toolResult: [],
     };
   }
 
+
   const results: any[] = [];
 
-  /*
-   * Execute tools sequentially.
-   *
-   * This is intentional because the planner
-   * determines the execution order.
-   */
 
-  for (const step of plan.steps) {
+  // ----------------------------------------------------------
+  // Execute tools
+  // ----------------------------------------------------------
+
+  for (
+    const step of plan.steps
+  ) {
+
     console.log(
       `\n🔧 Executing planned tool: ${step.tool}`
     );
@@ -367,49 +391,59 @@ async function executePlan(
       step.arguments
     );
 
-    /*
-     * Security boundary:
-     *
-     * Only tools explicitly registered in
-     * toolRegistry are allowed to execute.
-     */
+
+    // --------------------------------------------------------
+    // Security boundary
+    // --------------------------------------------------------
 
     const tool =
       toolRegistry[
         step.tool as keyof typeof toolRegistry
       ];
 
+
     if (!tool) {
+
       throw new Error(
         `Unknown tool requested by planner: ${step.tool}`
       );
     }
 
+
     try {
+
       const result =
         await tool.invoke(
           step.arguments
         );
 
+
       console.log(
         `✅ Tool completed: ${step.tool}`
       );
 
+
       results.push({
+
         tool: step.tool,
 
         arguments:
           step.arguments,
 
         result,
+
       });
+
     } catch (error) {
+
       console.error(
         `❌ Tool failed: ${step.tool}`,
         error
       );
 
+
       results.push({
+
         tool: step.tool,
 
         arguments:
@@ -419,150 +453,224 @@ async function executePlan(
           error instanceof Error
             ? error.message
             : "Unknown tool error",
+
       });
     }
   }
+
 
   console.log(
     "\n========== TOOL RESULTS =========="
   );
 
-  console.dir(results, {
-    depth: 10,
-  });
+  console.dir(
+    results,
+    {
+      depth: 10,
+    }
+  );
 
   console.log(
     "==================================\n"
   );
+
 
   return {
     toolResult: results,
   };
 }
 
+
 // ============================================================
-// 6. ANALYZER
+// 5. ANALYZER
 // ============================================================
 
 async function analyzeResults(
   state: typeof AgentState.State
 ) {
+
   const plan = state.plan as {
+
     intent: string;
+
     goal: string;
+
   };
 
+
   const toolResults =
-    state.toolResult ?? [];
+    state.toolResult;
 
-  /*
-   * We don't need the entire conversation for
-   * operational evidence, but the latest conversation
-   * context helps the analyzer understand references.
-   */
 
-  const conversationHistory =
-    (state.messages ?? [])
-      .map(
-        (message) => {
-          const role =
-            message instanceof HumanMessage
-              ? "User"
-              : message instanceof AIMessage
-              ? "Assistant"
-              : "System";
+  let responseInstructions = "";
 
-          return `${role}: ${normalizeMessageContent(
-            message
-          )}`;
-        }
-      )
-      .join("\n\n");
+
+  // ----------------------------------------------------------
+  // SERVICE STATUS
+  // ----------------------------------------------------------
+
+  if (
+    plan?.intent ===
+    "check_service_status"
+  ) {
+
+    responseInstructions = `
+The user asked for service status.
+
+Give a concise answer.
+
+Include only:
+
+- service status
+- uptime
+- deployed version
+
+Do NOT add troubleshooting analysis,
+likely causes, or generic next steps.
+`;
+  }
+
+
+  // ----------------------------------------------------------
+  // RECENT ERRORS
+  // ----------------------------------------------------------
+
+  else if (
+    plan?.intent ===
+    "get_recent_errors"
+  ) {
+
+    responseInstructions = `
+The user asked for recent errors.
+
+Give a concise list.
+
+For each error include:
+
+- error name
+- occurrence count
+- timestamp
+
+Do NOT provide root-cause analysis unless
+the user explicitly asks for it.
+`;
+  }
+
+
+  // ----------------------------------------------------------
+  // TROUBLESHOOTING
+  // ----------------------------------------------------------
+
+  else if (
+
+    plan?.intent ===
+      "troubleshoot_degraded_service" ||
+
+    plan?.intent ===
+      "troubleshoot_service_errors"
+
+  ) {
+
+    responseInstructions = `
+The user is troubleshooting a service.
+
+Use exactly these sections:
+
+### Evidence
+
+List important facts returned by the tools.
+
+### Likely Cause
+
+Explain the likely cause based ONLY
+on the retrieved evidence.
+
+Clearly distinguish inference from fact.
+
+Do NOT invent information.
+
+### Next Steps
+
+Provide 2-4 practical diagnostic steps.
+
+If error results are empty:
+
+- explicitly say that no recent errors
+were returned
+- say that available evidence is insufficient
+to determine the root cause
+- suggest additional information to retrieve
+`;
+  }
+
+
+  // ----------------------------------------------------------
+  // FALLBACK
+  // ----------------------------------------------------------
+
+  else {
+
+    responseInstructions = `
+Answer using only the available tool results.
+
+Keep the answer concise.
+`;
+  }
+
+
+  // ==========================================================
+  // MODEL CALL
+  // ==========================================================
 
   const response =
     await model.invoke([
-      new SystemMessage(`
+
+      {
+        role: "system",
+
+        content: `
 You are AegisAI's analysis component.
 
-Analyze the results collected by the tool executor
-and answer the user's original question.
+Analyze the tool results and answer the
+user's CURRENT request.
 
-You are given:
+Use ONLY information available in
+the tool results for operational claims.
 
-1. Conversation history
-2. User request
-3. Agent plan
-4. Tool results
-
---------------------------------------------------
-IMPORTANT RULES
---------------------------------------------------
-
-Use ONLY the information available in the
-tool results for operational claims.
-
-Do not invent:
+Never invent:
 
 - metrics
 - errors
 - versions
 - timestamps
-- infrastructure details
-- service states
-- logs
+- infrastructure
+- dependencies
+- deployment information
 
-If a tool failed, clearly mention that
-the information could not be retrieved.
-
-For troubleshooting questions:
-
-1. Identify important evidence.
-
-2. Explain the likely cause.
-
-3. Clearly distinguish:
-
-   FACTS
-
-   from
-
-   INFERENCE
-
-4. Provide practical next steps.
-
-Do not claim that an external monitoring system
-was accessed unless the tool result explicitly
-provides that information.
-
-Do not call tools.
-
-Keep the answer concise but useful.
-`),
-
-      new HumanMessage(`
-Conversation history:
-
-${conversationHistory}
+Do NOT call tools.
 
 --------------------------------------------------
 
+${responseInstructions}
+`,
+      },
+
+
+      {
+        role: "user",
+
+        content: `
 Original user request:
 
 ${state.userMessage}
-
---------------------------------------------------
 
 Agent intent:
 
 ${plan?.intent ?? "unknown"}
 
---------------------------------------------------
-
 Agent goal:
 
 ${plan?.goal ?? "unknown"}
-
---------------------------------------------------
 
 Tool results:
 
@@ -571,113 +679,183 @@ ${JSON.stringify(
   null,
   2
 )}
-`),
+`,
+      },
     ]);
+
 
   console.log(
     "\n========== ANALYZER RESPONSE =========="
   );
 
-  console.dir(response, {
-    depth: 8,
-  });
+  console.dir(
+    response,
+    {
+      depth: 8,
+    }
+  );
 
   console.log(
     "========================================\n"
   );
 
+
   return {
+
     answer:
-      typeof response.content === "string"
+      typeof response.content ===
+      "string"
+
         ? response.content
+
         : JSON.stringify(
             response.content
           ),
   };
 }
 
+
 // ============================================================
-// 7. DIRECT ANSWER
+// 6. DIRECT ANSWER
 // ============================================================
 
 async function generateDirectAnswer(
   state: typeof AgentState.State
 ) {
-  const conversationHistory =
-    (state.messages ?? [])
-      .map(
-        (message) => {
-          const role =
-            message instanceof HumanMessage
-              ? "User"
-              : message instanceof AIMessage
-              ? "Assistant"
-              : "System";
-
-          return `${role}: ${normalizeMessageContent(
-            message
-          )}`;
-        }
-      )
-      .join("\n\n");
 
   const response =
     await model.invoke([
-      new SystemMessage(`
+
+      {
+        role: "system",
+
+        content: `
 You are AegisAI.
 
 Answer the user's technical question directly.
 
-No external tools are required for this request.
+Use the conversation history when necessary.
 
-You may use the conversation history to understand
-follow-up questions and references.
+Do not claim to have retrieved live
+information unless tools were actually used.
 
-Do not claim to have retrieved live information.
+Keep the answer concise and useful.
+`,
+      },
 
-Do not invent real-time operational data.
-`),
 
-      new HumanMessage(`
-Conversation history:
+      {
+        role: "user",
 
-${conversationHistory}
+        content: `
+ACTUAL CONVERSATION HISTORY:
 
---------------------------------------------------
+${state.messages
+  .map((message) => {
 
-Current user request:
+    return `${message._getType()}: ${message.content}`;
+
+  })
+  .join("\n\n")}
+
+--------------------------------------------
+
+CURRENT USER REQUEST:
 
 ${state.userMessage}
-`),
+`,
+      },
     ]);
 
+
   return {
+
     answer:
-      typeof response.content === "string"
+      typeof response.content ===
+      "string"
+
         ? response.content
+
         : JSON.stringify(
             response.content
           ),
   };
 }
 
+
 // ============================================================
-// 8. DECIDE WHETHER TO EXECUTE TOOLS
+// 7. CLARIFICATION
 // ============================================================
 
-function shouldExecuteTools(
+async function clarification(
   state: typeof AgentState.State
 ) {
+
   const plan = state.plan as {
-    requiresTools?: boolean;
+
+    clarificationQuestion?: string;
+
   };
 
-  if (plan?.requiresTools) {
+
+  return {
+
+    answer:
+      plan?.clarificationQuestion ||
+      "Which service would you like me to check?",
+
+  };
+}
+
+
+// ============================================================
+// 8. ROUTER
+// ============================================================
+
+function routeAfterPlanner(
+  state: typeof AgentState.State
+) {
+
+  const plan = state.plan as {
+
+    requiresTools?: boolean;
+
+    needsClarification?: boolean;
+
+  };
+
+
+  // ----------------------------------------------------------
+  // Missing entity / ambiguous request
+  // ----------------------------------------------------------
+
+  if (
+    plan?.needsClarification
+  ) {
+
+    return "clarification";
+  }
+
+
+  // ----------------------------------------------------------
+  // Tools required
+  // ----------------------------------------------------------
+
+  if (
+    plan?.requiresTools
+  ) {
+
     return "executePlan";
   }
 
+
+  // ----------------------------------------------------------
+  // No tools required
+  // ----------------------------------------------------------
+
   return "directAnswer";
 }
+
 
 // ============================================================
 // 9. FINAL RESPONSE
@@ -686,39 +864,23 @@ function shouldExecuteTools(
 function buildFinalResponse(
   state: typeof AgentState.State
 ) {
-  const answer =
-    state.answer ||
-    "I was unable to generate a response.";
-
-  /*
-   * Persist assistant response in conversation
-   * memory.
-   *
-   * Since agent.service.ts adds the current
-   * HumanMessage and this node adds the AIMessage,
-   * the checkpoint contains:
-   *
-   * HumanMessage
-   * AIMessage
-   * HumanMessage
-   * AIMessage
-   * ...
-   */
 
   return {
+
     intent:
       state.intent ||
       "technical_question",
 
-    answer,
+    answer:
+      state.answer ||
+      "I was unable to generate a response.",
 
-    confidence: 0.95,
+    confidence:
+      0.95,
 
-    messages: [
-      new AIMessage(answer),
-    ],
   };
 }
+
 
 // ============================================================
 // 10. BUILD GRAPH
@@ -736,14 +898,16 @@ const workflow =
       createPlan
     )
 
+
     // --------------------------------------------------------
-    // Deterministic tool executor
+    // Tool executor
     // --------------------------------------------------------
 
     .addNode(
       "executePlan",
       executePlan
     )
+
 
     // --------------------------------------------------------
     // Analyzer
@@ -754,6 +918,7 @@ const workflow =
       analyzeResults
     )
 
+
     // --------------------------------------------------------
     // Direct answer
     // --------------------------------------------------------
@@ -762,6 +927,17 @@ const workflow =
       "directAnswer",
       generateDirectAnswer
     )
+
+
+    // --------------------------------------------------------
+    // Clarification
+    // --------------------------------------------------------
+
+    .addNode(
+      "clarification",
+      clarification
+    )
+
 
     // --------------------------------------------------------
     // Final response
@@ -772,6 +948,7 @@ const workflow =
       buildFinalResponse
     )
 
+
     // --------------------------------------------------------
     // START → Planner
     // --------------------------------------------------------
@@ -781,32 +958,41 @@ const workflow =
       "createPlan"
     )
 
+
     // --------------------------------------------------------
-    // Planner decision
+    // Planner routing
     // --------------------------------------------------------
 
     .addConditionalEdges(
+
       "createPlan",
 
-      shouldExecuteTools,
+      routeAfterPlanner,
 
       {
+
         executePlan:
           "executePlan",
 
         directAnswer:
           "directAnswer",
+
+        clarification:
+          "clarification",
+
       }
     )
 
+
     // --------------------------------------------------------
-    // Tool execution → Analyzer
+    // Tools → Analyzer
     // --------------------------------------------------------
 
     .addEdge(
       "executePlan",
       "analyzeResults"
     )
+
 
     // --------------------------------------------------------
     // Analyzer → Final
@@ -817,14 +1003,26 @@ const workflow =
       "finalResponse"
     )
 
+
     // --------------------------------------------------------
-    // Direct answer → Final
+    // Direct → Final
     // --------------------------------------------------------
 
     .addEdge(
       "directAnswer",
       "finalResponse"
     )
+
+
+    // --------------------------------------------------------
+    // Clarification → Final
+    // --------------------------------------------------------
+
+    .addEdge(
+      "clarification",
+      "finalResponse"
+    )
+
 
     // --------------------------------------------------------
     // Final → END
@@ -835,14 +1033,17 @@ const workflow =
       END
     );
 
-// ============================================================
-// 11. CHECKPOINTER
-// ============================================================
-
-const checkpointer = new MemorySaver();
 
 // ============================================================
-// 12. COMPILE GRAPH
+// 11. MEMORY CHECKPOINT
+// ============================================================
+
+const checkpointer =
+  new MemorySaver();
+
+
+// ============================================================
+// 12. COMPILE
 // ============================================================
 
 export const chatGraph =

@@ -2,6 +2,7 @@ import { Annotation } from "@langchain/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
 
 export const AgentState = Annotation.Root({
+
   userMessage: Annotation<string>({
     reducer: (_, value) => value,
     default: () => "",
@@ -38,5 +39,17 @@ export const AgentState = Annotation.Root({
   confidence: Annotation<number>({
     reducer: (_, value) => value,
     default: () => 0,
+  }),
+
+  // NEW
+  needsClarification: Annotation<boolean>({
+    reducer: (_, value) => value,
+    default: () => false,
+  }),
+
+  // NEW
+  clarificationQuestion: Annotation<string>({
+    reducer: (_, value) => value,
+    default: () => "",
   }),
 });
