@@ -2,13 +2,21 @@ import { Annotation } from "@langchain/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
 
 export const AgentState = Annotation.Root({
+
   userMessage: Annotation<string>({
     reducer: (_, value) => value,
     default: () => "",
   }),
 
+  // LLM-generated plan
+  plan: Annotation<unknown>({
+    reducer: (_, value) => value,
+    default: () => null,
+  }),
+
   messages: Annotation<BaseMessage[]>({
-    reducer: (current, update) => current.concat(update),
+    reducer: (current, update) =>
+      current.concat(update),
     default: () => [],
   }),
 
