@@ -4,7 +4,6 @@ import {
   END,
 } from "@langchain/langgraph";
 
-import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 
 import { AgentState } from "../state/agent.state.js";
@@ -17,7 +16,7 @@ import { plannerSchema } from "../schemas/planner.schema.js";
 import { env } from "../../config/env.js";
 
 // ============================================================
-// 1. Initialize Gemini
+// 1. Gemini Models
 // ============================================================
 
 const model = new ChatGoogleGenerativeAI({
@@ -26,34 +25,23 @@ const model = new ChatGoogleGenerativeAI({
   apiKey: env.GOOGLE_API_KEY,
 });
 
-// ============================================================
-// 2. Planner Model
-// ============================================================
-
+// Planner uses structured output
 const plannerModel =
   model.withStructuredOutput(
     plannerSchema
   );
 
 // ============================================================
-// 3. Register Tools
+// 2. Tool Registry
 // ============================================================
 
-const tools = [
-  getServiceStatusTool,
-  getRecentErrorsTool,
-];
-
-// Model gets access to tools
-const modelWithTools =
-  model.bindTools(tools);
-
-// ToolNode executes tools
-const toolNode =
-  new ToolNode(tools);
+const toolRegistry = {
+  get_service_status: getServiceStatusTool,
+  get_recent_errors: getRecentErrorsTool,
+};
 
 // ============================================================
-// 4. PLANNER NODE
+// 3. PLANNER
 // ============================================================
 
 async function createPlan(
@@ -67,8 +55,8 @@ async function createPlan(
         content: `
 You are the planning component of AegisAI.
 
-Your job is to analyze the user's request and
-create a structured execution plan.
+Your job is to analyze the user's request and create
+a structured execution plan.
 
 DO NOT answer the user.
 
@@ -141,36 +129,6 @@ Plan:
     }
   ]
 }
-
-Another example:
-
-User:
-"Why is payment-service degraded?"
-
-Plan:
-
-{
-  "intent": "diagnose_service",
-  "goal": "Determine why payment-service is degraded",
-  "requiresTools": true,
-  "steps": [
-    {
-      "tool": "get_service_status",
-      "reason": "Confirm the current service health",
-      "arguments": {
-        "service": "payment-service"
-      }
-    },
-    {
-      "tool": "get_recent_errors",
-      "reason": "Identify recent errors contributing to degradation",
-      "arguments": {
-        "service": "payment-service",
-        "limit": 5
-      }
-    }
-  ]
-}
 `,
       },
 
@@ -199,84 +157,199 @@ Plan:
 }
 
 // ============================================================
-// 5. MODEL NODE
+// 4. DETERMINISTIC TOOL EXECUTOR
 // ============================================================
 
-async function callModel(
+async function executePlan(
   state: typeof AgentState.State
 ) {
+  const plan = state.plan as {
+    intent: string;
+    goal: string;
+    requiresTools: boolean;
+    steps: Array<{
+      tool: string;
+      reason: string;
+      arguments: {
+        service?: string;
+        limit?: number;
+      };
+    }>;
+  };
+
+  // No tools required
+  if (
+    !plan ||
+    !plan.requiresTools ||
+    !plan.steps ||
+    plan.steps.length === 0
+  ) {
+    return {
+      toolResult: [],
+    };
+  }
+
+  const results = [];
+
+  for (const step of plan.steps) {
+    console.log(
+      `\n🔧 Executing planned tool: ${step.tool}`
+    );
+
+    console.log(
+      "Arguments:",
+      step.arguments
+    );
+
+    // ------------------------------------------
+    // Security boundary:
+    // Only tools explicitly registered above
+    // can be executed.
+    // ------------------------------------------
+
+    const tool =
+      toolRegistry[
+        step.tool as keyof typeof toolRegistry
+      ];
+
+    if (!tool) {
+      throw new Error(
+        `Unknown tool requested by planner: ${step.tool}`
+      );
+    }
+
+    try {
+      const result =
+        await tool.invoke(
+          step.arguments
+        );
+
+      console.log(
+        `✅ Tool completed: ${step.tool}`
+      );
+
+      results.push({
+        tool: step.tool,
+        arguments: step.arguments,
+        result,
+      });
+    } catch (error) {
+      console.error(
+        `❌ Tool failed: ${step.tool}`,
+        error
+      );
+
+      results.push({
+        tool: step.tool,
+        arguments: step.arguments,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unknown tool error",
+      });
+    }
+  }
+
+  console.log(
+    "\n========== TOOL RESULTS =========="
+  );
+
+  console.dir(results, {
+    depth: 10,
+  });
+
+  console.log(
+    "==================================\n"
+  );
+
+  return {
+    toolResult: results,
+  };
+}
+
+// ============================================================
+// 5. ANALYZER
+// ============================================================
+
+async function analyzeResults(
+  state: typeof AgentState.State
+) {
+  const plan = state.plan as {
+    intent: string;
+    goal: string;
+  };
+
+  const toolResults =
+    state.toolResult;
+
   const response =
-    await modelWithTools.invoke([
+    await model.invoke([
       {
         role: "system",
 
         content: `
-You are AegisAI, an engineering intelligence assistant.
+You are AegisAI's analysis component.
 
-You execute the execution plan created by the planner.
+Analyze the results collected by the tool executor
+and answer the user's original question.
 
-Available tools:
+You are given:
 
-1. get_service_status
+1. User request
+2. Agent plan
+3. Tool results
 
-Purpose:
-- current service status
-- service health
-- uptime
-- availability
-- deployed version
+Use ONLY the information available in the
+tool results for operational claims.
 
-2. get_recent_errors
+If a tool failed, clearly mention that the
+information could not be retrieved.
 
-Purpose:
-- recent errors
-- exceptions
-- failures
-- troubleshooting
-- investigating degraded services
+Do not invent metrics, errors, versions,
+timestamps, or infrastructure details.
 
-Rules:
+For troubleshooting questions:
 
-1. Follow the execution plan.
+- identify the important evidence
+- explain the likely cause
+- distinguish facts from inference
+- provide practical next steps
 
-2. Use the available tools when required.
+Keep the answer concise but useful.
 
-3. Do not invent tools.
+Do NOT call tools.
+`,
+      },
 
-4. If multiple steps are present, execute the
-   required tools and use their results together.
+      {
+        role: "user",
 
-5. After receiving the tool results, provide a
-   technically accurate final answer.
+        content: `
+Original user request:
 
-6. Do not claim that you lack access to monitoring
-   systems when the available tools provide the
-   requested information.
+${state.userMessage}
 
---------------------------------------------------
+Agent intent:
 
-EXECUTION PLAN:
+${plan?.intent ?? "unknown"}
+
+Agent goal:
+
+${plan?.goal ?? "unknown"}
+
+Tool results:
 
 ${JSON.stringify(
-  state.plan,
+  toolResults,
   null,
   2
 )}
 `,
       },
-
-      // User message MUST come after system message
-      {
-        role: "user",
-        content: state.userMessage,
-      },
-
-      // Previous AI / Tool messages
-      ...state.messages,
     ]);
 
   console.log(
-    "\n========== MODEL RESPONSE =========="
+    "\n========== ANALYZER RESPONSE =========="
   );
 
   console.dir(response, {
@@ -284,167 +357,203 @@ ${JSON.stringify(
   });
 
   console.log(
-    "====================================\n"
+    "========================================\n"
   );
 
   return {
-    messages: [response],
+    answer:
+      typeof response.content === "string"
+        ? response.content
+        : JSON.stringify(
+            response.content
+          ),
   };
 }
 
 // ============================================================
-// 6. DECIDE NEXT STEP AFTER MODEL
+// 6. DIRECT ANSWER
 // ============================================================
 
-function shouldContinue(
+async function generateDirectAnswer(
   state: typeof AgentState.State
 ) {
-  const lastMessage =
-    state.messages[
-      state.messages.length - 1
-    ];
+  const response =
+    await model.invoke([
+      {
+        role: "system",
 
-  // Check if the model requested tools
-  if (
-    "tool_calls" in lastMessage &&
-    Array.isArray(lastMessage.tool_calls) &&
-    lastMessage.tool_calls.length > 0
-  ) {
-    return "tools";
-  }
+        content: `
+You are AegisAI.
 
-  // No tool calls means model produced
-  // the final answer.
-  return "finalResponse";
+Answer the user's technical question directly.
+
+No external tools are required for this request.
+
+Do not claim to have retrieved live information.
+`,
+      },
+
+      {
+        role: "user",
+        content: state.userMessage,
+      },
+    ]);
+
+  return {
+    answer:
+      typeof response.content === "string"
+        ? response.content
+        : JSON.stringify(
+            response.content
+          ),
+  };
 }
 
 // ============================================================
-// 7. FINAL RESPONSE NODE
+// 7. DECIDE WHETHER TO EXECUTE TOOLS
 // ============================================================
 
-function extractFinalResponse(
+function shouldExecuteTools(
   state: typeof AgentState.State
 ) {
-  const lastMessage =
-    state.messages[
-      state.messages.length - 1
-    ];
+  const plan = state.plan as {
+    requiresTools?: boolean;
+  };
 
-  let answer = "";
-
-  if (
-    typeof lastMessage.content === "string"
-  ) {
-    answer = lastMessage.content;
-  } else {
-    answer = JSON.stringify(
-      lastMessage.content
-    );
+  if (plan?.requiresTools) {
+    return "executePlan";
   }
 
-  return {
-    answer,
+  return "directAnswer";
+}
 
-    // Intent comes from planner
+// ============================================================
+// 8. FINAL RESPONSE
+// ============================================================
+
+function buildFinalResponse(
+  state: typeof AgentState.State
+) {
+  return {
     intent:
       state.intent ||
       "technical_question",
 
-    // Temporary confidence.
-    // We'll replace this with a proper
-    // evaluation/confidence mechanism later.
+    answer:
+      state.answer ||
+      "I was unable to generate a response.",
+
     confidence: 0.95,
   };
 }
 
 // ============================================================
-// 8. BUILD LANGGRAPH
+// 9. BUILD GRAPH
 // ============================================================
 
 const workflow =
   new StateGraph(AgentState)
 
-    // ----------------------------------------------
+    // -----------------------------
     // Planner
-    // ----------------------------------------------
+    // -----------------------------
 
     .addNode(
       "createPlan",
       createPlan
     )
 
-    // ----------------------------------------------
-    // LLM / Agent
-    // ----------------------------------------------
+    // -----------------------------
+    // Deterministic executor
+    // -----------------------------
 
     .addNode(
-      "callModel",
-      callModel
+      "executePlan",
+      executePlan
     )
 
-    // ----------------------------------------------
-    // Tool execution
-    // ----------------------------------------------
+    // -----------------------------
+    // Analyze tool results
+    // -----------------------------
 
     .addNode(
-      "tools",
-      toolNode
+      "analyzeResults",
+      analyzeResults
     )
 
-    // ----------------------------------------------
-    // Final response
-    // ----------------------------------------------
+    // -----------------------------
+    // Direct answer
+    // -----------------------------
+
+    .addNode(
+      "directAnswer",
+      generateDirectAnswer
+    )
+
+    // -----------------------------
+    // Final state
+    // -----------------------------
 
     .addNode(
       "finalResponse",
-      extractFinalResponse
+      buildFinalResponse
     )
 
-    // ----------------------------------------------
+    // -----------------------------
     // START
-    // ----------------------------------------------
+    // -----------------------------
 
     .addEdge(
       START,
       "createPlan"
     )
 
-    // ----------------------------------------------
-    // Planner → Model
-    // ----------------------------------------------
-
-    .addEdge(
-      "createPlan",
-      "callModel"
-    )
-
-    // ----------------------------------------------
-    // Model → Tools OR Final Response
-    // ----------------------------------------------
+    // -----------------------------
+    // Planner decision
+    // -----------------------------
 
     .addConditionalEdges(
-      "callModel",
-
-      shouldContinue,
-
+      "createPlan",
+      shouldExecuteTools,
       {
-        tools: "tools",
-        finalResponse: "finalResponse",
+        executePlan:
+          "executePlan",
+
+        directAnswer:
+          "directAnswer",
       }
     )
 
-    // ----------------------------------------------
-    // Tool → Model
-    // ----------------------------------------------
+    // -----------------------------
+    // Tool execution → Analyzer
+    // -----------------------------
 
     .addEdge(
-      "tools",
-      "callModel"
+      "executePlan",
+      "analyzeResults"
     )
 
-    // ----------------------------------------------
-    // Final Response → END
-    // ----------------------------------------------
+    // -----------------------------
+    // Analyzer → Final
+    // -----------------------------
+
+    .addEdge(
+      "analyzeResults",
+      "finalResponse"
+    )
+
+    // -----------------------------
+    // Direct answer → Final
+    // -----------------------------
+
+    .addEdge(
+      "directAnswer",
+      "finalResponse"
+    )
+
+    // -----------------------------
+    // Final → END
+    // -----------------------------
 
     .addEdge(
       "finalResponse",
@@ -452,7 +561,7 @@ const workflow =
     );
 
 // ============================================================
-// 9. Compile
+// 10. Compile
 // ============================================================
 
 export const chatGraph =
