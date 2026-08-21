@@ -2,27 +2,32 @@ import { Annotation } from "@langchain/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
 
 export const AgentState = Annotation.Root({
-
   userMessage: Annotation<string>({
     reducer: (_, value) => value,
     default: () => "",
   }),
 
-  // LLM-generated plan
-  plan: Annotation<unknown>({
-    reducer: (_, value) => value,
-    default: () => null,
+  messages: Annotation<BaseMessage[]>({
+    reducer: (current, update) => [
+      ...current,
+      ...update,
+    ],
+    default: () => [],
   }),
 
-  messages: Annotation<BaseMessage[]>({
-    reducer: (current, update) =>
-      current.concat(update),
-    default: () => [],
+  plan: Annotation<any>({
+    reducer: (_, value) => value,
+    default: () => null,
   }),
 
   intent: Annotation<string>({
     reducer: (_, value) => value,
     default: () => "",
+  }),
+
+  toolResult: Annotation<any[]>({
+    reducer: (_, value) => value,
+    default: () => [],
   }),
 
   answer: Annotation<string>({
@@ -33,10 +38,5 @@ export const AgentState = Annotation.Root({
   confidence: Annotation<number>({
     reducer: (_, value) => value,
     default: () => 0,
-  }),
-
-  toolResult: Annotation<unknown>({
-    reducer: (_, value) => value,
-    default: () => null,
   }),
 });
